@@ -33,7 +33,7 @@ setup(
         "six",
         "dateparser",
         "aiohttp",
-        "websockets",
+        "picows",
         "pycryptodome",
     ],
     keywords="binance exchange rest api bitcoin ethereum btc eth neo",

@@ -2,12 +2,11 @@ import sys
 import pytest
 import gzip
 import json
-from unittest.mock import patch, create_autospec, Mock
+from unittest.mock import patch, Mock
 from binance.ws.reconnecting_websocket import ReconnectingWebsocket
 from binance.ws.constants import WSListenerState
 from binance.exceptions import BinanceWebsocketUnableToConnect, ReadLoopClosed
-from websockets import WebSocketClientProtocol  # type: ignore
-from websockets.protocol import State
+import picows
 import asyncio
 
 try:
@@ -83,16 +82,52 @@ async def test_recv_message():
     assert result == {"test": "data"}
 
 
+class MockFrame:
+    def __init__(self, msg_type, payload):
+        self.msg_type = msg_type
+        self._payload = payload
+
+    def get_payload_as_utf8_text(self):
+        return self._payload
+
+    def get_payload_as_bytes(self):
+        return self._payload
+
+
+class MockTransport:
+    def __init__(self, listener):
+        self.listener = listener
+        self.sent = []
+        self._disconnected = asyncio.Event()
+
+    def send(self, msg_type, payload):
+        self.sent.append((msg_type, payload))
+
+    def send_close(self):
+        self.listener.on_ws_disconnected(self)
+        self._disconnected.set()
+
+    def disconnect(self, graceful=False):
+        self._disconnected.set()
+
+    async def wait_disconnected(self):
+        await self._disconnected.wait()
+
+    def emit_text(self, payload: str):
+        frame = MockFrame(picows.WSMsgType.TEXT, payload)
+        self.listener.on_ws_frame(self, frame)
+
+
 @pytest.mark.skipif(sys.version_info < (3, 8), reason="Requires Python 3.8+")
 @pytest.mark.asyncio
 async def test_before_reconnect():
     ws = ReconnectingWebsocket(url="wss://test.url")
     ws.ws = AsyncMock()
-    ws._conn = AsyncMock()
+    ws_connection = ws.ws
     ws._reconnects = 0
     await ws.before_reconnect()
+    ws_connection.close.assert_awaited_once()
     assert ws.ws is None
-    ws._conn.__aexit__.assert_awaited()
     assert ws._reconnects == 1
 
 
@@ -110,14 +145,14 @@ async def test_connect_max_reconnects_exceeded():
     ws.MAX_RECONNECTS = 2  # type: ignore # Set max reconnects to a low number for testing
     ws._before_connect = AsyncMock()
     ws._after_connect = AsyncMock()
-    ws._conn = AsyncMock()
-    exception = Exception("Connection failed")
-    ws._conn.__aenter__.side_effect = exception
-
     with patch.object(ws._log, "error") as mock_log:
-        with pytest.raises(BinanceWebsocketUnableToConnect):
-            for _ in range(3):  # Exceed MAX_RECONNECTS
-                await ws._run_reconnect()
+        with patch(
+            "binance.ws.reconnecting_websocket.picows.ws_connect",
+            side_effect=Exception("Connection failed"),
+        ):
+            with pytest.raises(BinanceWebsocketUnableToConnect):
+                for _ in range(3):  # Exceed MAX_RECONNECTS
+                    await ws._run_reconnect()
         mock_log.assert_called_with(f"Max reconnections {ws.MAX_RECONNECTS} reached:")
 
     assert ws._reconnects == ws.MAX_RECONNECTS
@@ -126,17 +161,23 @@ async def test_connect_max_reconnects_exceeded():
 @pytest.mark.skipif(sys.version_info < (3, 8), reason="Requires Python 3.8+")
 @pytest.mark.asyncio
 async def test_recieve_invalid_json():
-    # Create mock WebSocket client
-    mock_socket = create_autospec(WebSocketClientProtocol)
-    mock_socket.recv = AsyncMock(return_value="invalid json{")
-    mock_socket.state = AsyncMock()
+    transport = None
 
-    # Mock websockets.connect to return our mock socket
-    with patch("websockets.connect") as mock_connect:
-        mock_connect.return_value.__aenter__.return_value = mock_socket
+    async def _mock_connect(listener_factory, *_args, **_kwargs):
+        nonlocal transport
+        listener = listener_factory()
+        transport = MockTransport(listener)
+        listener.on_ws_connected(transport)
+        return transport, listener
 
+    with patch(
+        "binance.ws.reconnecting_websocket.picows.ws_connect",
+        side_effect=_mock_connect,
+    ):
         ws = ReconnectingWebsocket(url="wss://test.url")
         async with ws:
+            assert transport is not None
+            transport.emit_text("invalid json{")
             msg = await ws.recv()
             assert msg["e"] == "error"
             assert msg["type"] == "JSONDecodeError"  # JSON parsing error
@@ -145,18 +186,24 @@ async def test_recieve_invalid_json():
 @pytest.mark.skipif(sys.version_info < (3, 8), reason="Requires Python 3.8+")
 @pytest.mark.asyncio
 async def test_receive_valid_json():
-    # Create mock WebSocket client
     msgRecv = '{"e": "value"}'
-    mock_socket = create_autospec(WebSocketClientProtocol)
-    mock_socket.recv = AsyncMock(return_value=msgRecv)
-    mock_socket.state = AsyncMock()
+    transport = None
 
-    # Mock websockets.connect to return our mock socket
-    with patch("websockets.connect") as mock_connect:
-        mock_connect.return_value.__aenter__.return_value = mock_socket
+    async def _mock_connect(listener_factory, *_args, **_kwargs):
+        nonlocal transport
+        listener = listener_factory()
+        transport = MockTransport(listener)
+        listener.on_ws_connected(transport)
+        return transport, listener
 
+    with patch(
+        "binance.ws.reconnecting_websocket.picows.ws_connect",
+        side_effect=_mock_connect,
+    ):
         ws = ReconnectingWebsocket(url="wss://test.url")
         async with ws:
+            assert transport is not None
+            transport.emit_text(msgRecv)
             msg = await ws.recv()
             assert msg == json.loads(msgRecv)
 
@@ -166,48 +213,44 @@ async def test_receive_valid_json():
 async def test_connect_fails_to_connect_on_enter_context():
     """Test ws.connect raises a ConnectionClosedError."""
     ws = ReconnectingWebsocket(url="wss://test.url")
-    ws._conn = AsyncMock()
-    exception = Exception("Connection closed")
-    ws._conn.__aenter__.side_effect = exception
-    with pytest.raises(Exception):
-        await ws.__aenter__()
+    with patch(
+        "binance.ws.reconnecting_websocket.picows.ws_connect",
+        side_effect=Exception("Connection closed"),
+    ):
+        with pytest.raises(Exception):
+            await ws.__aenter__()
 
 
 @pytest.mark.skipif(sys.version_info < (3, 8), reason="Requires Python 3.8+")
 @pytest.mark.asyncio
 async def test_connect_fails_to_connect_after_disconnect():
-    # Create mock WebSocket client
-    mock_socket = create_autospec(WebSocketClientProtocol)
-    mock_socket.recv = AsyncMock(side_effect=delayed_return)
-    mock_socket.state = AsyncMock()
+    connect_calls = 0
 
-    # Create mock connect that succeeds first, then fails
-    mock_connect = AsyncMock()
-    mock_connect.return_value.__aenter__.side_effect = [
-        mock_socket,  # First call succeeds
-        Exception("Connection failed"),  # Subsequent calls fail
-    ]
+    async def _mock_connect(listener_factory, *_args, **_kwargs):
+        nonlocal connect_calls
+        connect_calls += 1
+        if connect_calls > 1:
+            raise Exception("Connection failed")
+        listener = listener_factory()
+        transport = MockTransport(listener)
+        listener.on_ws_connected(transport)
+        return transport, listener
 
-    with patch("websockets.connect", return_value=mock_connect.return_value):
+    with patch(
+        "binance.ws.reconnecting_websocket.picows.ws_connect",
+        side_effect=_mock_connect,
+    ):
         ws = ReconnectingWebsocket(url="wss://test.url")
         async with ws as ws:
             assert ws.ws is not None
-            msg = await ws.recv()
-            ws.ws.state = State.CLOSED
+            ws.ws._transport.emit_text('{"e":"value"}')
+            _ = await ws.recv()
             await ws.ws.close()
-            while msg["e"] != "error":
+            msg = await ws.recv()
+            while msg["type"] in {"ConnectionError", "BinanceWebsocketClosed"}:
                 msg = await ws.recv()
-            # Receive the closed message attempting to reconnect
-            while msg["type"] == "BinanceWebsocketClosed":
-                msg = await ws.recv()
-            # After retrying to reconnect, receive BinanceWebsocketUnableToConnect
             assert msg["e"] == "error"
             assert msg["type"] == "BinanceWebsocketUnableToConnect"
-
-
-async def delayed_return():
-    await asyncio.sleep(0.1)  # 100 ms delay
-    return '{"e": "value"}'
 
 
 @pytest.mark.skipif(sys.version_info < (3, 8), reason="Requires Python 3.8+")
