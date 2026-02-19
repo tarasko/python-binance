@@ -90,7 +90,7 @@ class WebsocketAPI(ReconnectingWebsocket):
             try:
                 if (
                     self.ws is None
-                    or getattr(self.ws, "closed", True)
+                    or self.ws.closed
                     or self.ws_state != WSListenerState.STREAMING
                 ):
                     await self.connect()
@@ -105,7 +105,7 @@ class WebsocketAPI(ReconnectingWebsocket):
                             self._log.info("Connection is reconnecting, waiting...")
                             await self._wait_for_reconnect()
 
-                        elif self.ws is None or getattr(self.ws, "closed", True):
+                        elif self.ws is None or self.ws.closed:
                             self._log.info("Connection lost, reconnecting...")
                             await self.connect()
 
