@@ -30,9 +30,9 @@ _DISCONNECT_SENTINEL = object()
 
 
 class _PicowsWebSocket(picows.WSListener):
-    def __init__(self, queue: asyncio.Queue):
+    def __init__(self):
         self._transport = None
-        self._queue = queue
+        self._queue = asyncio.Queue()
         self.closed = False
 
     def on_ws_connected(self, transport):
@@ -55,6 +55,7 @@ class _PicowsWebSocket(picows.WSListener):
         if self.closed:
             raise ConnectionError("WebSocket is closed")
         msg = await self._queue.get()
+        self._queue.task_done()
         if msg is _DISCONNECT_SENTINEL:
             self.closed = True
             raise ConnectionError("WebSocket disconnected")
@@ -107,7 +108,6 @@ class ReconnectingWebsocket:
         self.ws: Optional[_PicowsWebSocket] = None
         self.ws_state = WSListenerState.INITIALISING
         self._queue = asyncio.Queue()
-        self._ws_raw_queue: asyncio.Queue = asyncio.Queue()
         self._handle_read_loop = None
         self._https_proxy = https_proxy
         self._ws_kwargs = kwargs
@@ -154,9 +154,8 @@ class ReconnectingWebsocket:
                 raise ValueError(
                     "picows does not support https:// proxy URLs; use http://, socks4://, or socks5://"
                 )
-            self._ws_raw_queue = asyncio.Queue()
             _, self.ws = await picows.ws_connect(
-                lambda: _PicowsWebSocket(self._ws_raw_queue),
+                _PicowsWebSocket,
                 ws_url,
                 proxy=self._https_proxy,
                 **self._ws_kwargs,
